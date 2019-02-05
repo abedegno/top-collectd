@@ -1,3 +1,6 @@
+[![Build
+Status](https://travis-ci.org/abedegno/top-collectd.svg?branch=master)](https://travis-ci.org/abedegno/top-collectd)
+
 # top-collectd
 
 top-collectd provides a native collectd reader plugin to report top processes and their percentage CPU Usage. 
