@@ -1,24 +1,14 @@
-use std::io;
-use std::io::BufRead;
+use std::error;
 use std::fs;
-use std::fs::File;
-use glob::glob;
-use sysconf::raw::sysconf;
-use sysconf::raw::SysconfVariable;
+use std::io::{self, BufRead};
+use std::thread;
 use std::time::Duration;
-use shuteye::sleep;
-
-extern crate shuteye;
-extern crate glob;
-extern crate sysconf;
-#[macro_use]extern crate collectd_plugin;
-#[macro_use]extern crate scan_fmt;
 
 use collectd_plugin::{
-    ConfigItem, Plugin, PluginCapabilities, PluginManager, PluginRegistration, Value,
-    ValueListBuilder,
+    collectd_plugin, ConfigItem, Plugin, PluginCapabilities, PluginManager, PluginRegistration,
+    Value, ValueListBuilder,
 };
-use std::error;
+use glob::glob;
 
 #[derive(Default)]
 struct TopCollectdPlugin;
@@ -33,182 +23,161 @@ struct Proc {
 impl Proc {
     fn new(tid: u64, cputime: u64, cmd: &str) -> Proc {
         Proc {
-            tid: tid,
-            cputime: cputime,
-            cmd: cmd.to_string()
+            tid,
+            cputime,
+            cmd: cmd.to_string(),
         }
     }
 }
 
 #[derive(Debug)]
 struct Top {
-    tid: u64,
-    cputime: u64,    
+    cputime: u64,
     cmd: String,
-    pcpu: f64
+    pcpu: f64,
 }
 
 impl Top {
-    fn new(tid: u64, cputime: u64, cmd: &str, pcpu: f64) -> Top {
+    fn new(cputime: u64, cmd: &str, pcpu: f64) -> Top {
         Top {
-            tid: tid,
-            cputime: cputime,            
+            cputime,
             cmd: cmd.to_string(),
-            pcpu: pcpu
+            pcpu,
         }
     }
 }
 
+/// Get the total CPU time from `/proc/stat`.
+///
+/// Sums the first 8 numeric fields (user, nice, system, idle, iowait, irq,
+/// softirq, steal) from the aggregate `cpu` line.
+fn get_total_cpu_time() -> Result<u64, Box<dyn error::Error>> {
+    let file = fs::File::open("/proc/stat")?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
 
+    let total: u64 = line
+        .split_whitespace()
+        .skip(1) // skip "cpu"
+        .take(8) // user, nice, system, idle, iowait, irq, softirq, steal
+        .filter_map(|s| s.parse::<u64>().ok())
+        .sum();
 
-// Get the total CPU time from /proc/stat
-// TODO better error handling
-fn get_total_cpu_time() -> u64 {
-	let file = File::open("/proc/stat").expect("Can't open file");
-	let mut reader = io::BufReader::new(file);
-	let mut line = String::new();
-    let _len = reader.read_line(&mut line).expect("Error reading line");
-
-    // TODO More efficien way of capturing this?
-    let (user, nice, system, idle, iowait, irq, softirq, steal, _guest, _guestnice) = scan_fmt!(&line.to_string(), // input string
-		"cpu  {} {} {} {} {} {} {} {} {} {}",   // format
-        u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
-
-    return user.unwrap_or(0) 
-    	+ nice.unwrap_or(0) 
-    	+ system.unwrap_or(0) 
-    	+ idle.unwrap_or(0) 
-    	+ iowait.unwrap_or(0) 
-    	+ irq.unwrap_or(0) 
-    	+ softirq.unwrap_or(0) 
-    	+ steal.unwrap_or(0);
+    Ok(total)
 }
 
+/// Read process CPU times from `/proc/[pid]/stat`, sorted by tid.
+///
+/// Gracefully skips processes that disappear between the glob and read
+/// (short-lived processes, permission errors, etc.).
 fn get_processes_ordered() -> Vec<Proc> {
-	// GET Processes
-	let mut procs :Vec<Proc> = Vec::new();
-	let res = glob("/proc/[0-9]*/stat").expect("Can't glob path");
-	for entry in res
-	{
-		let path = entry.expect("No filename");
-		let contents = fs::read_to_string(path)
-			.expect("Something went wrong reading the file");
-		
-		let split: Vec<&str> = contents.split(" ").collect();
+    let mut procs: Vec<Proc> = Vec::new();
 
-		// utime + stime
-		let cputime = split.get(13).unwrap().parse::<u64>().unwrap() + split.get(14).unwrap().parse::<u64>().unwrap();
+    let entries = match glob("/proc/[0-9]*/stat") {
+        Ok(entries) => entries,
+        Err(_) => return procs,
+    };
 
-		let proc = Proc::new(
-			split.get(0).unwrap().parse::<u64>().unwrap(),	// tid
-			cputime,
-			split.get(1).unwrap() // cmd
-			);
-		procs.push(proc);
-	}
+    for entry in entries.flatten() {
+        let contents = match fs::read_to_string(&entry) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
 
-    // Sort by tid ascending
-	procs.sort_unstable_by(|a, b| a.tid.cmp(&b.tid));
-	return procs
+        let fields: Vec<&str> = contents.split_whitespace().collect();
+        if fields.len() < 15 {
+            continue;
+        }
+
+        let tid = match fields[0].parse::<u64>() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // utime (field 14) + stime (field 15) — 0-indexed as 13 and 14
+        let utime = fields[13].parse::<u64>().unwrap_or(0);
+        let stime = fields[14].parse::<u64>().unwrap_or(0);
+        let cputime = utime + stime;
+
+        // Strip parentheses from command name, e.g. "(httpd)" -> "httpd"
+        let cmd = fields[1].trim_matches(|c| c == '(' || c == ')');
+
+        procs.push(Proc::new(tid, cputime, cmd));
+    }
+
+    procs.sort_unstable_by_key(|p| p.tid);
+    procs
 }
 
-
-
-// A manager decides the name of the family of plugins and also registers one or more plugins based
-// on collectd's configuration files
+// A manager decides the name of the family of plugins and also registers one
+// or more plugins based on collectd's configuration files.
 impl PluginManager for TopCollectdPlugin {
-    // A plugin needs a unique name to be referenced by collectd
     fn name() -> &'static str {
         "top"
     }
 
-    // Our plugin might have configuration section in collectd.conf, which will be passed here if
-    // present. Our contrived plugin doesn't care about configuration so it returns only a single
-    // plugin (itself).
-    fn plugins(_config: Option<&[ConfigItem]>) -> Result<PluginRegistration, Box<error::Error>> {
+    fn plugins(
+        _config: Option<&[ConfigItem]>,
+    ) -> Result<PluginRegistration, Box<dyn error::Error>> {
         Ok(PluginRegistration::Single(Box::new(TopCollectdPlugin)))
     }
 }
 
 impl Plugin for TopCollectdPlugin {
-    // We define that our plugin will only be reporting / submitting values to writers
     fn capabilities(&self) -> PluginCapabilities {
         PluginCapabilities::READ
     }
 
-    fn read_values(&self) -> Result<(), Box<error::Error>> {
-        // Create a list of values to submit to collectd. 
+    fn read_values(&self) -> Result<(), Box<dyn error::Error>> {
+        let num_cpus = num_cpus::get() as f64;
 
-		// Get CPU count
-		let num_cpus = sysconf(SysconfVariable::ScNprocessorsOnln).unwrap();	
+        // Take two snapshots 500ms apart to calculate CPU usage
+        let total_cpu_time1 = get_total_cpu_time()?;
+        let procs1 = get_processes_ordered();
 
-		// Get initial total CPU Time
-		let total_cpu_time1 = get_total_cpu_time();
+        thread::sleep(Duration::from_millis(500));
 
-		// Get initial process CPU usage
-		let procs1 = get_processes_ordered();
+        let total_cpu_time2 = get_total_cpu_time()?;
+        let procs2 = get_processes_ordered();
 
-	    /* 500 ms in ns */
-	    sleep(Duration::new(0, 500 * 1000 * 1000));
+        let total_cpu_time = total_cpu_time2.saturating_sub(total_cpu_time1);
+        if total_cpu_time == 0 {
+            return Ok(());
+        }
 
-	    // Get after total CPU time
-	    let total_cpu_time2 = get_total_cpu_time();
+        // Calculate per-process CPU usage using a merge-join on sorted tid lists
+        let mut top_list: Vec<Top> = Vec::new();
+        let (mut pos1, mut pos2) = (0, 0);
 
-	    // Get after process CPU usage
-		let procs2 = get_processes_ordered();	
+        while pos1 < procs1.len() && pos2 < procs2.len() {
+            match procs1[pos1].tid.cmp(&procs2[pos2].tid) {
+                std::cmp::Ordering::Less => pos1 += 1,
+                std::cmp::Ordering::Greater => pos2 += 1,
+                std::cmp::Ordering::Equal => {
+                    let cputime = procs2[pos2].cputime.saturating_sub(procs1[pos1].cputime);
+                    let pcpu = (cputime as f64 / total_cpu_time as f64) * 100.0 * num_cpus;
 
-		// Calculate difference in total CPU time
-	    let total_cpu_time = total_cpu_time2 - total_cpu_time1;
+                    top_list.push(Top::new(cputime, &procs2[pos2].cmd, pcpu));
+                    pos1 += 1;
+                    pos2 += 1;
+                }
+            }
+        }
 
-		// Calculate CPU usage between readings
-		let mut top_list :Vec<Top> = Vec::new();
-		let (mut pos1, mut pos2) = (0usize, 0usize);
-		while pos1 < procs1.len() && pos2 < procs2.len()
-		{
-			if procs1[pos1].tid < procs2[pos2].tid
-			{
-				pos1+=1;
-			}
-			else if procs1[pos1].tid > procs2[pos2].tid {
-				pos2+=1;
-			}
-			else 
-			{
-				let cputime = procs2[pos2].cputime - procs1[pos1].cputime;
-				let top = Top::new(
-					procs2[pos2].tid,	// tid
-					cputime,					
-					&procs2[pos2].cmd, // cmd
-					(cputime  as f64 / total_cpu_time  as f64) * 100.0 * num_cpus as f64
-				);
-				;
-				top_list.push(top);
-				pos2+=1;
-				pos1+=1;
-			}
-		}
+        // Sort by CPU time descending and report top 10
+        top_list.sort_by(|a, b| b.cputime.cmp(&a.cputime));
 
-		// Sort by CPU time descending
-		top_list.sort_by(|a, b| b.cputime.cmp(&a.cputime));
-
-		for i in (0..top_list.len()).take(10)
-		{
-			let top = &top_list[i];
-			let values = vec![Value::Gauge(top.pcpu)];
-
-	        ValueListBuilder::new(Self::name(), "percent")
-	            .values(&values)
-	            .plugin_instance(&top.cmd as &str)
-	            .type_instance("cpu")
-	            .submit()?;
-		}
-        
-
-        // Submit our values to collectd. A plugin can submit any number of times.
+        for top in top_list.iter().take(10) {
+            ValueListBuilder::new(Self::name(), "percent")
+                .values(&[Value::Gauge(top.pcpu)])
+                .plugin_instance(top.cmd.as_str())
+                .type_instance("cpu")
+                .submit()?;
+        }
 
         Ok(())
     }
 }
 
-// We pass in our plugin manager type
 collectd_plugin!(TopCollectdPlugin);

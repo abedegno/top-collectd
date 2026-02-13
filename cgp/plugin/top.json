@@ -1,0 +1,8 @@
+{
+	"top": {
+		"title": "Top process CPU on {{HOST}} - {{PINSTANCE}}",
+		"vertical": "% CPU",
+		"type": "default",
+		"legend_format": "%.1lf%%"
+	}
+}

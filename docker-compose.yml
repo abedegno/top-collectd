@@ -1,0 +1,49 @@
+services:
+  build:
+    profiles: [build]
+    build:
+      context: .
+      target: builder
+    volumes:
+      - ./dist:/out
+    entrypoint: ["cp", "/usr/src/top-collectd/target/release/libtop.so", "/out/libtop.so"]
+
+  test:
+    profiles: [test]
+    build:
+      context: .
+      target: test
+    volumes:
+      - /proc:/proc:ro
+
+  collectd-rrd:
+    profiles: [cgp]
+    build:
+      context: .
+      target: collectd-rrd
+    volumes:
+      - /proc:/proc:ro
+      - rrd-data:/var/lib/collectd/rrd
+    entrypoint: ["collectd", "-C", "/etc/collectd/collectd-rrd.conf", "-f"]
+    configs:
+      - source: collectd-rrd-conf
+        target: /etc/collectd/collectd-rrd.conf
+
+  cgp:
+    profiles: [cgp]
+    build:
+      context: .
+      target: cgp
+    ports:
+      - "8080:80"
+    volumes:
+      - rrd-data:/var/lib/collectd/rrd:ro
+    depends_on:
+      - collectd-rrd
+
+volumes:
+  rrd-data:
+
+configs:
+  collectd-rrd-conf:
+    file: ./test/collectd-rrd.conf
